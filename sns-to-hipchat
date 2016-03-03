@@ -106,7 +106,13 @@ class HookHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         rawresponse = ''.join(uo)
         uo.close()
         assert uo.code == 204
-
+        
+        # Respond to subscription confirmation requests
+        post_type = post['Type']
+        if AUTO_SUBSCRIBE and post_type == "SubscriptionConfirmation":
+            subscribe_url = post['SubscribeURL']
+            r = rget(subscribe_url)
+            
         # Finalise response to caller
         s.send_response(200)
         s.end_headers()
