@@ -1,0 +1,125 @@
+#!/usr/bin/env python
+#-*- coding:utf-8 -*-
+
+import BaseHTTPServer
+import os
+import sys
+import urlparse
+import json
+import logging
+import logging.handlers
+from urlparse import urlparse, parse_qs
+from urllib2 import Request, urlopen
+from M2Crypto import X509
+from base64 import b64decode
+from requests import get as rget
+from re import compile as regex_compile, IGNORECASE
+
+logging.basicConfig()
+logger = logging.getLogger('sns-to-hipchat')
+logger.addHandler(logging.handlers.SysLogHandler())
+logger.setLevel(logging.INFO)
+
+HOST_NAME = sys.argv[1]
+PORT_NUMBER = int(sys.argv[2])
+
+AUTO_SUBSCRIBE = True
+
+HIPCHAT_V2_TOKEN = os.getenv("HIPCHAT_V2_TOKEN")
+HIPCHAT_ROOM_ID = os.getenv("HIPCHAT_ROOM_ID")
+
+def build_notification_string(msg):
+    not_str = 'Message\n' + msg[u'Message'] + '\nMessageId\n' + \
+              msg[u'MessageId']
+    if u'Subject' in msg.keys():
+        not_str = not_str + '\nSubject\n' + msg[u'Subject']
+    not_str = not_str + '\nTimestamp\n' + msg[u'Timestamp'] + \
+                        '\nTopicArn\n' + msg[u'TopicArn'] + '\nType\n' + \
+                        msg[u'Type'] + '\n'
+    return not_str
+
+
+def build_subscription_string(msg):
+    sub_str = 'Message\n' + msg[u'Message'] + '\nMessageId\n' + \
+              msg[u'MessageId'] + '\nSubscribeURL\n' + msg[u'SubscribeURL'] + \
+              '\nTimestamp\n' + msg[u'Timestamp'] + '\nToken\n' + \
+              msg[u'Token'] + '\nTopicArn\n' + msg[u'TopicArn'] + \
+              '\nType\n' + msg[u'Type'] + '\n'
+    return sub_str
+
+
+def is_message_signature_valid(msg):
+    if msg[u'SignatureVersion'] != '1':
+        raise Exception('Wrong signature version')
+
+    signing_url = msg[u'SigningCertURL']
+    prog = regex_compile(r'^https://sns\.[-a-z0-9]+\.amazonaws\.com/.*$', IGNORECASE)
+    if not prog.match(signing_url):
+        raise Exception("Cert is not hosted at AWS URL (https): %s",
+                        signing_url)
+
+    r = rget(signing_url)
+    cert = X509.load_cert_string(str(r.text))
+    str_to_sign = None
+    if msg[u'Type'] == 'Notification':
+        str_to_sign = build_notification_string(msg)
+    elif any(msg[u'Type'] == s for s in ['SubscriptionConfirmation',
+                                         'UnsubscribeConfirmation']):
+        str_to_sign = build_subscription_string(msg)
+
+    pubkey = cert.get_pubkey()
+    pubkey.reset_context(md='sha1')
+    pubkey.verify_init()
+    pubkey.verify_update(str_to_sign.encode())
+    result = pubkey.verify_final(b64decode(msg['Signature']))
+    if result != 1:
+        raise Exception('Notification could not be confirmed')
+    else:
+        return True
+
+class HookHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+    server_version = "SNSToHipchatHandler/0.1"
+    
+    def do_POST(s):
+        length = int(s.headers['Content-Length'])
+        post_raw = s.rfile.read(length).decode('utf-8')
+        
+        # Verify signature
+        post = json.loads(post_raw)
+        is_message_signature_valid(post)
+        
+        # Send to HipChat using API v2
+        message = post['Message']
+        url = 'https://api.hipchat.com/v2/room/%d/notification' % int(HIPCHAT_ROOM_ID)
+        headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer %s" % HIPCHAT_V2_TOKEN
+        }
+        datastr = json.dumps({
+            'message': message,
+            'color': 'yellow',
+            'message_format': 'html',
+            'notify': False
+        })
+        request = Request(url, headers=headers, data=datastr)
+        uo = urlopen(request)
+        rawresponse = ''.join(uo)
+        uo.close()
+        assert uo.code == 204
+
+        # Finalise response to caller
+        s.send_response(200)
+        s.end_headers()
+        s.wfile.write("We're done here.")
+
+if __name__ == '__main__':
+    server_class = BaseHTTPServer.HTTPServer
+    httpd = server_class((HOST_NAME, PORT_NUMBER), HookHandler)
+    logger.info("Webhook server starts - %s:%s" % (HOST_NAME, PORT_NUMBER))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    httpd.server_close()
+    logger.info("Webhook service stops - %s:%s" % (HOST_NAME, PORT_NUMBER))
+
